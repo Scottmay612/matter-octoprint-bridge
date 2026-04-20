@@ -1,21 +1,3 @@
-/*
- *
- *    Copyright (c) 2020 Project CHIP Authors
- *    All rights reserved.
- *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
- *
- *        http://www.apache.org/licenses/LICENSE-2.0
- *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
- */
-
 #include "LightingAppCommandDelegate.h"
 #include "LightingManager.h"
 #include <AppMain.h>
@@ -26,14 +8,11 @@
 #include <app/ConcreteAttributePath.h>
 #include <app/server/Server.h>
 #include <lib/support/logging/CHIPLogging.h>
-
-#include <string>
-
-#include <thread>
-#include <chrono>
-#include <iostream>
 #include <app-common/zap-generated/attributes/Accessors.h>
 #include <platform/PlatformManager.h>
+#include <platform/CHIPDeviceLayer.h>
+#include <app/util/attribute-table.h>
+#include <app/clusters/temperature-measurement-server/CodegenIntegration.h>
 
 #if defined(CHIP_IMGUI_ENABLED) && CHIP_IMGUI_ENABLED
 #include <imgui_ui/ui.h>
@@ -46,42 +25,142 @@
 using namespace chip;
 using namespace chip::app;
 using namespace chip::app::Clusters;
+using namespace chip::DeviceLayer;
 
 namespace {
-
 NamedPipeCommands sChipNamedPipeCommands;
 LightingAppCommandDelegate sLightingAppCommandDelegate;
 } // namespace
 
-void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath & attributePath, uint8_t type, uint16_t size,
-                                       uint8_t * value)
+// Run a python script and return its output as a float, returns -1 on failure
+float RunPythonScript(const char* scriptPath) {
+    FILE* pipe = popen(scriptPath, "r");
+    if (!pipe) return -1.0f;
+
+    char buffer[128];
+    float result = -1.0f;
+    if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        char* endptr;
+        float val = std::strtof(buffer, &endptr);
+        if (endptr != buffer) {
+            result = val;
+        }
+    }
+    pclose(pipe);
+    return result;
+}
+
+void PollingTimerCallback(System::Layer * systemLayer, void * appState) {
+
+    
+// --- FETCH HOTEND TEMPERATURE (Now a Thermostat!) ---
+    float temp = RunPythonScript("python3 ./get_temp.py");
+    if (temp >= 0.0f) {
+        int16_t matterTemp = static_cast<int16_t>(temp * 100);
+        chip::app::DataModel::Nullable<int16_t> nullableTemp;
+        nullableTemp.SetNonNull(matterTemp);
+        
+        // Use the Thermostat SET command, NOT the TemperatureMeasurement one
+        (void)chip::app::Clusters::Thermostat::Attributes::LocalTemperature::Set(2, nullableTemp);
+    }
+    
+    // --- FETCH BED TEMPERATURE ---
+    float bedTemp = RunPythonScript("python3 ./get_bed_temp.py");
+    if (bedTemp >= 0.0f) {
+        int16_t matterBedTemp = static_cast<int16_t>(bedTemp * 100);
+        chip::app::DataModel::Nullable<int16_t> nullableBedTemp;
+        nullableBedTemp.SetNonNull(matterBedTemp);
+        (void)chip::app::Clusters::Thermostat::Attributes::LocalTemperature::Set(3, nullableBedTemp);
+    }
+    
+    // --- FETCH PRINT PROGRESS ---
+    float progress = RunPythonScript("python3 ./get_progress.py");
+    
+    if (progress < 0.0f) {
+        progress = 0.0f; 
+    }
+
+    uint8_t matterBrightness = static_cast<uint8_t>((progress / 100.0f) * 254);
+    if (matterBrightness == 0 && progress > 0.0f) matterBrightness = 1;
+    
+    chip::app::DataModel::Nullable<uint8_t> nullableLevel(matterBrightness);
+    (void)LevelControl::Attributes::CurrentLevel::Set(1, nullableLevel);
+    
+    
+    // --- SYNC ON/OFF WITH PRINTER STATE (only on change) ---
+    float isPrinting = RunPythonScript("python3 ./get_state.py");
+    bool printerOn = (isPrinting == 1.0f);
+
+    bool currentOnOff = false;
+    OnOff::Attributes::OnOff::Get(1, &currentOnOff);
+
+    if (printerOn != currentOnOff) {
+        (void)chip::app::Clusters::OnOff::Attributes::OnOff::Set(1, printerOn);
+    }
+    
+    // Schedule next poll in 5 seconds (CRITICAL: Give OctoPrint time to breathe!)
+    systemLayer->StartTimer(System::Clock::Milliseconds32(5000), PollingTimerCallback, nullptr);
+}
+
+void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath & attributePath, uint8_t type, uint16_t size, uint8_t * value)
 {
+    // --- 1. LIGHTBULB ON/OFF (PAUSE/RESUME PRINT) ---
     if (attributePath.mClusterId == OnOff::Id && attributePath.mAttributeId == OnOff::Attributes::OnOff::Id)
     {
         if (*value) {
-            system("gpioset -t0 -c gpiochip4 26=1"); // Turn physical LED ON
+            system("python3 ./resume_print.py");
         } else {
-            system("gpioset -t0 -c gpiochip4 26=0"); // Turn physical LED OFF
+            system("python3 ./pause_print.py");
         }
         LightingMgr().InitiateAction(*value ? LightingManager::ON_ACTION : LightingManager::OFF_ACTION);
     }
+    
+    // --- 2. PROGRESS BAR (READ ONLY) ---
+    if (attributePath.mClusterId == LevelControl::Id && 
+        attributePath.mAttributeId == LevelControl::Attributes::CurrentLevel::Id)
+    {
+        return; 
+    }
+
+    // --- 3. CATCH THE TEMPERATURE DIAL TURNING ---
+    if (attributePath.mClusterId == Thermostat::Id && 
+        attributePath.mAttributeId == Thermostat::Attributes::OccupiedHeatingSetpoint::Id)
+    {
+        int16_t matterTargetTemp;
+        memcpy(&matterTargetTemp, value, sizeof(matterTargetTemp));
+        float targetTemp = matterTargetTemp / 100.0f;
+
+        char cmd[128];
+        if (attributePath.mEndpointId == 2) {
+            // It was the Hotend dial
+            snprintf(cmd, sizeof(cmd), "python3 ./set_hotend_temp.py %.1f", targetTemp);
+            system(cmd);
+        } else if (attributePath.mEndpointId == 3) {
+            // It was the Bed dial
+            snprintf(cmd, sizeof(cmd), "python3 ./set_bed_temp.py %.1f", targetTemp);
+            system(cmd);
+        }
+    }
+
+    // --- 4. CATCH THE "OFF" MODE BUTTON ---
+    if (attributePath.mClusterId == Thermostat::Id && 
+        attributePath.mAttributeId == Thermostat::Attributes::SystemMode::Id)
+    {
+        // If the value is 0, the user tapped "Off" in the Google Home App
+        if (*value == 0) { 
+            if (attributePath.mEndpointId == 2) {
+                // Turn off Hotend
+                system("python3 ./set_hotend_temp.py 0.0");
+            } else if (attributePath.mEndpointId == 3) {
+                // Turn off Bed
+                system("python3 ./set_bed_temp.py 0.0");
+            }
+        }
+        // (If they tap "Heat", Google Home automatically resends the dial temp, 
+        // which triggers block #3 above and heats it right back up!)
+    }
 }
 
-/** @brief OnOff Cluster Init
- *
- * This function is called when a specific cluster is initialized. It gives the
- * application an opportunity to take care of cluster initialization procedures.
- * It is called exactly once for each endpoint where cluster is present.
- *
- * @param endpoint   Ver.: always
- *
- * TODO Issue #3841
- * emberAfOnOffClusterInitCallback happens before the stack initialize the cluster
- * attributes to the default value.
- * The logic here expects something similar to the deprecated Plugins callback
- * emberAfPluginOnOffClusterServerPostInitCallback.
- *
- */
 void emberAfOnOffClusterInitCallback(EndpointId endpoint)
 {
     // TODO: implement any additional Cluster Server init actions
@@ -89,15 +168,46 @@ void emberAfOnOffClusterInitCallback(EndpointId endpoint)
 
 void ApplicationInit()
 {
-    std::string path = std::string(LinuxDeviceOptions::GetInstance().app_pipe);
+    // 1. Force the Thermostat to be "Heating Only" (2)
+    // Cast to the strict ControlSequenceOfOperationEnum type!
+    auto heatingOnly = static_cast<chip::app::Clusters::Thermostat::ControlSequenceOfOperationEnum>(2);
+    (void)chip::app::Clusters::Thermostat::Attributes::ControlSequenceOfOperation::Set(2, heatingOnly);
+    (void)chip::app::Clusters::Thermostat::Attributes::ControlSequenceOfOperation::Set(3, heatingOnly);
 
+    // 2. Give it a safe default target temperature (20.0°C) so Google Home doesn't freak out
+    int16_t defaultTemp = 2000;
+    (void)chip::app::Clusters::Thermostat::Attributes::OccupiedHeatingSetpoint::Set(2, defaultTemp);
+    (void)chip::app::Clusters::Thermostat::Attributes::OccupiedHeatingSetpoint::Set(3, defaultTemp);
+
+    // 3. Force BOTH Thermostats into "Heat" mode (4)
+    // Cast to the strict SystemModeEnum type!
+    auto heatMode = static_cast<chip::app::Clusters::Thermostat::SystemModeEnum>(4);
+    (void)chip::app::Clusters::Thermostat::Attributes::SystemMode::Set(2, heatMode);
+    (void)chip::app::Clusters::Thermostat::Attributes::SystemMode::Set(3, heatMode);
+
+    // 4. Hardcode Hotend Limits (0°C to 300°C)
+    int16_t minTemp = 0;
+    int16_t maxHotend = 30000;
+    (void)chip::app::Clusters::Thermostat::Attributes::AbsMinHeatSetpointLimit::Set(2, minTemp);
+    (void)chip::app::Clusters::Thermostat::Attributes::MinHeatSetpointLimit::Set(2, minTemp);
+    (void)chip::app::Clusters::Thermostat::Attributes::AbsMaxHeatSetpointLimit::Set(2, maxHotend);
+    (void)chip::app::Clusters::Thermostat::Attributes::MaxHeatSetpointLimit::Set(2, maxHotend);
+
+    // 5. Hardcode Bed Limits (0°C to 120°C)
+    int16_t maxBed = 12000;
+    (void)chip::app::Clusters::Thermostat::Attributes::AbsMinHeatSetpointLimit::Set(3, minTemp);
+    (void)chip::app::Clusters::Thermostat::Attributes::MinHeatSetpointLimit::Set(3, minTemp);
+    (void)chip::app::Clusters::Thermostat::Attributes::AbsMaxHeatSetpointLimit::Set(3, maxBed);
+    (void)chip::app::Clusters::Thermostat::Attributes::MaxHeatSetpointLimit::Set(3, maxBed);
+
+    // 6. Start the pipe
+    std::string path = std::string(LinuxDeviceOptions::GetInstance().app_pipe);
     if ((!path.empty()) and (sChipNamedPipeCommands.Start(path, &sLightingAppCommandDelegate) != CHIP_NO_ERROR))
     {
         ChipLogError(NotSpecified, "Failed to start CHIP NamedPipeCommands");
         TEMPORARY_RETURN_IGNORED sChipNamedPipeCommands.Stop();
     }
 }
-
 void ApplicationShutdown()
 {
     if (sChipNamedPipeCommands.Stop() != CHIP_NO_ERROR)
@@ -106,45 +216,7 @@ void ApplicationShutdown()
     }
 }
 
-// --- OUR NEW C++ BACKGROUND THREAD ---
-void PollOctoPrint() {
-    while (true) {
-        FILE* pipe = popen("python3 /home/smay123/get_temp.py", "r");
-        if (pipe) {
-            char buffer[128];
-            if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                
-                // 1. NO EXCEPTIONS: Use strtof instead of stof
-                char* endptr;
-                float tempC = std::strtof(buffer, &endptr);
-
-                // If endptr moved, it successfully read a number
-                if (endptr != buffer) { 
-                    int16_t matterTemp = static_cast<int16_t>(tempC * 100);
-
-                    // 2. NO CAPTURING LAMBDAS: Pass the variable through the intptr_t argument
-                    (void)chip::DeviceLayer::PlatformMgr().ScheduleWork(
-                        [](intptr_t arg) {
-                            int16_t temp = static_cast<int16_t>(arg);
-                            chip::app::Clusters::TemperatureMeasurement::Attributes::MeasuredValue::Set(2, temp);
-                        },
-                        static_cast<intptr_t>(matterTemp)
-                    );
-                } else {
-                    ChipLogError(NotSpecified, "Failed to parse temperature from Python script");
-                }
-            }
-            pclose(pipe);
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-    }
-}
-// -------------------------------------
-
 #ifdef __NuttX__
-// NuttX requires the main function to be defined with C-linkage. However, marking
-// the main as extern "C" is not strictly conformant with the C++ standard. Since
-// clang >= 20 such code triggers -Wmain warning.
 extern "C" {
 #endif
 
@@ -162,18 +234,16 @@ int main(int argc, char * argv[])
         chip::DeviceLayer::PlatformMgr().Shutdown();
         return -1;
     }
-    
-    std::thread octoThread(PollOctoPrint);
-    octoThread.detach();
+
+    // Start the polling timer immediately
+    DeviceLayer::SystemLayer().StartTimer(System::Clock::Milliseconds32(0), PollingTimerCallback, nullptr);
 
 #if defined(CHIP_IMGUI_ENABLED) && CHIP_IMGUI_ENABLED
     example::Ui::ImguiUi ui;
-
     ui.AddWindow(std::make_unique<example::Ui::Windows::QRCode>());
     ui.AddWindow(std::make_unique<example::Ui::Windows::Connectivity>());
     ui.AddWindow(std::make_unique<example::Ui::Windows::OccupancySensing>(chip::EndpointId(1), "Occupancy"));
     ui.AddWindow(std::make_unique<example::Ui::Windows::Light>(chip::EndpointId(1)));
-
     ChipLinuxAppMainLoop(&ui);
 #else
     ChipLinuxAppMainLoop();
