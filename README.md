@@ -2,7 +2,7 @@
 
 This repository contains the custom source code for my Matter-to-OctoPrint smart home integration. It allows an Ender 3 Pro running OctoPrint to connect natively to Google Home via the Matter protocol, entirely bypassing the need for third-party cloud servers or heavy Homebridge plugins.
 
-**Note for grading/review:** This repo only contains the specific custom files I wrote and modified. It does not include the full 10GB Matter SDK required to actually compile the C++ application. 
+**Note:** This repo only contains the specific custom files I wrote and modified. It does not include the full 10GB Matter SDK required to actually compile the C++ application. 
 
 ## Architecture
 
