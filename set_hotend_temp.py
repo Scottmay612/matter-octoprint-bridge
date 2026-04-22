@@ -1,12 +1,14 @@
 import sys
 import requests
 import os
+
 # Grab the temperature passed from C++
 if len(sys.argv) < 2:
     sys.exit(1)
     
 target_temp = float(sys.argv[1])
 
+# Requires a set "OCTOPRINT_API_KEY" environment variable
 API_KEY = os.environ.get("OCTOPRINT_API_KEY")
 URL = "http://localhost:5000/api/printer/tool"
 

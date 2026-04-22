@@ -2,6 +2,7 @@ import requests
 import time
 import os
 
+# Requires a set "OCTOPRINT_API_KEY" environment variable
 API_KEY = os.environ.get("OCTOPRINT_API_KEY")
 OCTOPRINT_URL = "http://localhost:5000/api/job"
 
