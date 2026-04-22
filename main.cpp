@@ -52,42 +52,46 @@ float RunPythonScript(const char* scriptPath) {
 
 void PollingTimerCallback(System::Layer * systemLayer, void * appState) {
 
-    
-// --- FETCH HOTEND TEMPERATURE (Now a Thermostat!) ---
+    // Get hotend temperature
     float temp = RunPythonScript("python3 ./get_temp.py");
+
     if (temp >= 0.0f) {
         int16_t matterTemp = static_cast<int16_t>(temp * 100);
         chip::app::DataModel::Nullable<int16_t> nullableTemp;
         nullableTemp.SetNonNull(matterTemp);
-        
-        // Use the Thermostat SET command, NOT the TemperatureMeasurement one
-        (void)chip::app::Clusters::Thermostat::Attributes::LocalTemperature::Set(2, nullableTemp);
+
+        // Set the temperature to endpoint 2 (hotend)
+        (void)chip::app:Clusters::Thermostat::Attributes::LocalTemperature::Set(2, nullableTemp);
     }
     
-    // --- FETCH BED TEMPERATURE ---
-    float bedTemp = RunPythonScript("python3 ./get_bed_temp.py");
+    // Get bed temperature
+    float bedTemp = RunPythonScript("python3 ./get_bed_temp.py")
     if (bedTemp >= 0.0f) {
         int16_t matterBedTemp = static_cast<int16_t>(bedTemp * 100);
         chip::app::DataModel::Nullable<int16_t> nullableBedTemp;
         nullableBedTemp.SetNonNull(matterBedTemp);
+        
+        // Set the temperature to endpoint 3 (bed)
         (void)chip::app::Clusters::Thermostat::Attributes::LocalTemperature::Set(3, nullableBedTemp);
     }
+
     
-    // --- FETCH PRINT PROGRESS ---
-    float progress = RunPythonScript("python3 ./get_progress.py");
-    
+    // Get print progress
+    float progress = RunPythonScript("python3 ./get_progress.py")
+
+    // Handle case where the printer is not active
     if (progress < 0.0f) {
-        progress = 0.0f; 
+        progress = 0.0f;
     }
 
     uint8_t matterBrightness = static_cast<uint8_t>((progress / 100.0f) * 254);
-    if (matterBrightness == 0 && progress > 0.0f) matterBrightness = 1;
-    
+    if (matterBrightness == 0 && progress > 0.0f) matterBrightness = 1; // Sets the minimum active amount to 1 so that the light stays on
+
+    // Set the progress to the level control on endpoint 1 (dimmable lightbulb)
     chip::app::DataModel::Nullable<uint8_t> nullableLevel(matterBrightness);
     (void)LevelControl::Attributes::CurrentLevel::Set(1, nullableLevel);
     
-    
-    // --- SYNC ON/OFF WITH PRINTER STATE (only on change) ---
+    // Sync on/off with printer state so that it can be controlled through Matter or OctoPrint
     float isPrinting = RunPythonScript("python3 ./get_state.py");
     bool printerOn = (isPrinting == 1.0f);
 
@@ -95,16 +99,17 @@ void PollingTimerCallback(System::Layer * systemLayer, void * appState) {
     OnOff::Attributes::OnOff::Get(1, &currentOnOff);
 
     if (printerOn != currentOnOff) {
+        // Set the new printer state
         (void)chip::app::Clusters::OnOff::Attributes::OnOff::Set(1, printerOn);
     }
-    
-    // Schedule next poll in 5 seconds (CRITICAL: Give OctoPrint time to breathe!)
+
+    // Schedule the next poll for 5 seconds in the future
     systemLayer->StartTimer(System::Clock::Milliseconds32(5000), PollingTimerCallback, nullptr);
 }
 
 void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath & attributePath, uint8_t type, uint16_t size, uint8_t * value)
 {
-    // --- 1. LIGHTBULB ON/OFF (PAUSE/RESUME PRINT) ---
+    // Lighbulb On/Off
     if (attributePath.mClusterId == OnOff::Id && attributePath.mAttributeId == OnOff::Attributes::OnOff::Id)
     {
         if (*value) {
@@ -112,17 +117,17 @@ void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath & 
         } else {
             system("python3 ./pause_print.py");
         }
-        LightingMgr().InitiateAction(*value ? LightingManager::ON_ACTION : LightingManager::OFF_ACTION);
+        LightingMgr().InitiateAction(*Value ? LightingManager::ON_ACTION : LightingManager::OFF_ACTION);
     }
     
-    // --- 2. PROGRESS BAR (READ ONLY) ---
+    // Get progress bar number (read only)
     if (attributePath.mClusterId == LevelControl::Id && 
         attributePath.mAttributeId == LevelControl::Attributes::CurrentLevel::Id)
     {
         return; 
     }
 
-    // --- 3. CATCH THE TEMPERATURE DIAL TURNING ---
+    // Catch temperature dial change
     if (attributePath.mClusterId == Thermostat::Id && 
         attributePath.mAttributeId == Thermostat::Attributes::OccupiedHeatingSetpoint::Id)
     {
@@ -142,66 +147,58 @@ void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath & 
         }
     }
 
-    // --- 4. CATCH THE "OFF" MODE BUTTON ---
-    if (attributePath.mClusterId == Thermostat::Id && 
+    // Catch the off mode button
+    if (attributePath.mClusterId == Thermostat::Id &&
         attributePath.mAttributeId == Thermostat::Attributes::SystemMode::Id)
-    {
-        // If the value is 0, the user tapped "Off" in the Google Home App
-        if (*value == 0) { 
-            if (attributePath.mEndpointId == 2) {
-                // Turn off Hotend
-                system("python3 ./set_hotend_temp.py 0.0");
-            } else if (attributePath.mEndpointId == 3) {
-                // Turn off Bed
-                system("python3 ./set_bed_temp.py 0.0");
+        {
+            // If the value is 1, the user tapped "Off" in the Google Home app
+            if (*value == 0) {
+                if (attributePath.mEndPointId == 2) {
+                    // Turn off Hotend
+                    system("python3 ./set_hotend_temp.py 0.0");
+                } else if (attributePath.mEndpointId == 3) {
+                    // Turn off bed
+                    system("python3 ./set_bed_temp.py 0.0");
+                }
             }
         }
-        // (If they tap "Heat", Google Home automatically resends the dial temp, 
-        // which triggers block #3 above and heats it right back up!)
-    }
-}
-
-void emberAfOnOffClusterInitCallback(EndpointId endpoint)
-{
-    // TODO: implement any additional Cluster Server init actions
 }
 
 void ApplicationInit()
 {
-    // 1. Force the Thermostat to be "Heating Only" (2)
-    // Cast to the strict ControlSequenceOfOperationEnum type!
+    // Force the thermostat to be heating only (both thermostats)
     auto heatingOnly = static_cast<chip::app::Clusters::Thermostat::ControlSequenceOfOperationEnum>(2);
     (void)chip::app::Clusters::Thermostat::Attributes::ControlSequenceOfOperation::Set(2, heatingOnly);
     (void)chip::app::Clusters::Thermostat::Attributes::ControlSequenceOfOperation::Set(3, heatingOnly);
 
-    // 2. Give it a safe default target temperature (20.0°C) so Google Home doesn't freak out
+    // Give safe default start temperature (both thermostats)
     int16_t defaultTemp = 2000;
     (void)chip::app::Clusters::Thermostat::Attributes::OccupiedHeatingSetpoint::Set(2, defaultTemp);
     (void)chip::app::Clusters::Thermostat::Attributes::OccupiedHeatingSetpoint::Set(3, defaultTemp);
 
-    // 3. Force BOTH Thermostats into "Heat" mode (4)
-    // Cast to the strict SystemModeEnum type!
+    // Force both thermostats into "Heat" mode (both thermostats)
     auto heatMode = static_cast<chip::app::Clusters::Thermostat::SystemModeEnum>(4);
     (void)chip::app::Clusters::Thermostat::Attributes::SystemMode::Set(2, heatMode);
     (void)chip::app::Clusters::Thermostat::Attributes::SystemMode::Set(3, heatMode);
 
-    // 4. Hardcode Hotend Limits (0°C to 300°C)
+    // Set hotend limits
     int16_t minTemp = 0;
     int16_t maxHotend = 30000;
+
     (void)chip::app::Clusters::Thermostat::Attributes::AbsMinHeatSetpointLimit::Set(2, minTemp);
     (void)chip::app::Clusters::Thermostat::Attributes::MinHeatSetpointLimit::Set(2, minTemp);
     (void)chip::app::Clusters::Thermostat::Attributes::AbsMaxHeatSetpointLimit::Set(2, maxHotend);
     (void)chip::app::Clusters::Thermostat::Attributes::MaxHeatSetpointLimit::Set(2, maxHotend);
 
-    // 5. Hardcode Bed Limits (0°C to 120°C)
+    // Set bed limits
     int16_t maxBed = 12000;
+
     (void)chip::app::Clusters::Thermostat::Attributes::AbsMinHeatSetpointLimit::Set(3, minTemp);
     (void)chip::app::Clusters::Thermostat::Attributes::MinHeatSetpointLimit::Set(3, minTemp);
     (void)chip::app::Clusters::Thermostat::Attributes::AbsMaxHeatSetpointLimit::Set(3, maxBed);
     (void)chip::app::Clusters::Thermostat::Attributes::MaxHeatSetpointLimit::Set(3, maxBed);
 
-    // 6. Start the pipe
-    std::string path = std::string(LinuxDeviceOptions::GetInstance().app_pipe);
+    // Start the pipe
     if ((!path.empty()) and (sChipNamedPipeCommands.Start(path, &sLightingAppCommandDelegate) != CHIP_NO_ERROR))
     {
         ChipLogError(NotSpecified, "Failed to start CHIP NamedPipeCommands");
